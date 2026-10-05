@@ -49,7 +49,7 @@ def insert_report(data: dict) -> int:
             image_hash, image_name, category, severity, priority,
             drain_risk, confidence, recommended_action, analysis_mode, status
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             datetime.now(timezone.utc).isoformat(),
