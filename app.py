@@ -7,12 +7,14 @@ from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
-from PIL import Image, ImageChops, ImageStat
+from PIL import Image
 
 from database import init_db, insert_report, fetch_reports, update_report_status, report_stats
 from ai_engine import analyze_report
-from hotspot import build_hotspot_table, calculate_priority
+from hotspot import build_hotspot_table
 from verification import compare_images
+
+MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB limit
 
 
 st.set_page_config(
@@ -39,13 +41,11 @@ def get_secret(name: str):
 def image_hash(uploaded_file) -> str | None:
     if uploaded_file is None:
         return None
-    raw = uploaded_file.getvalue()
-    return hashlib.sha256(raw).hexdigest()
-
-
-def reset_form():
-    for key in ["description", "location", "latitude", "longitude"]:
-        st.session_state[key] = ""
+    try:
+        raw = uploaded_file.getvalue()
+        return hashlib.sha256(raw).hexdigest()
+    except Exception:
+        return None
 
 
 # ---------- Styling ----------
@@ -119,8 +119,8 @@ with st.sidebar:
                 "longitude": 79.1050,
             },
         ]
-        existing = fetch_reports()
         for item in demo:
+            existing = fetch_reports()
             result = analyze_report(item["description"], item["location"], existing)
             insert_report({
                 **item,
@@ -154,11 +154,19 @@ if page == "Citizen Report":
         image_file = st.file_uploader(
             "Garbage photo",
             type=["jpg", "jpeg", "png", "webp"],
-            help="For the final hackathon version this image can be analyzed by a real vision model.",
+            help="Optional photo of the garbage issue.",
         )
 
         if image_file:
-            st.image(image_file, caption="Selected image", use_container_width=True)
+            if image_file.size > MAX_IMAGE_SIZE_BYTES:
+                st.error("Uploaded image exceeds the 10 MB size limit.")
+                image_file = None
+            else:
+                try:
+                    st.image(image_file, caption="Selected image", use_container_width=True)
+                except Exception:
+                    st.error("Invalid or corrupted image file.")
+                    image_file = None
 
         description = st.text_area(
             "What is happening?",
@@ -213,8 +221,15 @@ if page == "Citizen Report":
                 st.stop()
 
             existing = fetch_reports()
-            img_bytes = image_file.getvalue() if image_file else None
-            mime_type = image_file.type if image_file else None
+            img_bytes = None
+            mime_type = None
+            if image_file:
+                try:
+                    img_bytes = image_file.getvalue()
+                    mime_type = image_file.type
+                except Exception:
+                    st.warning("Could not read image file bytes; proceeding with text analysis.")
+
             api_key = get_secret("GEMINI_API_KEY")
 
             with st.spinner("Analyzing the report..."):
@@ -275,29 +290,37 @@ elif page == "Admin Dashboard":
             "id", "created_at", "location", "category", "severity",
             "priority", "drain_risk", "status"
         ]
+        # Safeguard columns presence
+        available_cols = [c for c in display_cols if c in df.columns]
         st.dataframe(
-            df[display_cols],
+            df[available_cols],
             use_container_width=True,
             hide_index=True,
         )
 
         st.subheader("Manage a report")
         selected_id = st.selectbox("Select report ID", df["id"].tolist())
-        selected = df[df["id"] == selected_id].iloc[0]
+        selected_rows = df[df["id"] == selected_id]
+        if not selected_rows.empty:
+            selected = selected_rows.iloc[0]
 
-        st.write(f"**Description:** {selected['description']}")
-        st.write(f"**Recommended action:** {selected['recommended_action']}")
+            st.write(f"**Description:** {selected.get('description', '')}")
+            st.write(f"**Recommended action:** {selected.get('recommended_action', '')}")
 
-        new_status = st.selectbox(
-            "Update status",
-            ["Reported", "Verified", "Assigned", "In Progress", "Resolved"],
-            index=["Reported", "Verified", "Assigned", "In Progress", "Resolved"].index(selected["status"]),
-        )
+            status_options = ["Reported", "Verified", "Assigned", "In Progress", "Resolved"]
+            current_status = selected.get("status", "Reported")
+            status_index = status_options.index(current_status) if current_status in status_options else 0
 
-        if st.button("Update status", type="primary"):
-            update_report_status(int(selected_id), new_status)
-            st.success("Status updated.")
-            st.rerun()
+            new_status = st.selectbox(
+                "Update status",
+                status_options,
+                index=status_index,
+            )
+
+            if st.button("Update status", type="primary"):
+                update_report_status(int(selected_id), new_status)
+                st.success("Status updated.")
+                st.rerun()
 
         st.download_button(
             "Download reports as CSV",
@@ -324,10 +347,13 @@ elif page == "Hotspot Intelligence":
         st.dataframe(hotspot_df, use_container_width=True, hide_index=True)
 
         map_df = pd.DataFrame(reports)
-        map_df = map_df.dropna(subset=["latitude", "longitude"])
-        if not map_df.empty:
-            st.subheader("Report map")
-            st.map(map_df[["latitude", "longitude"]], zoom=11)
+        if "latitude" in map_df.columns and "longitude" in map_df.columns:
+            map_df = map_df.dropna(subset=["latitude", "longitude"])
+            if not map_df.empty:
+                st.subheader("Report map")
+                st.map(map_df[["latitude", "longitude"]], zoom=11)
+            else:
+                st.warning("No GPS coordinates available for mapping.")
         else:
             st.warning("No GPS coordinates available for mapping.")
 
@@ -355,15 +381,17 @@ elif page == "Resolution Verification":
             st.image(after, caption="After", use_container_width=True)
 
         if st.button("🔎 Verify cleanup", type="primary"):
-            result = compare_images(
-                Image.open(io.BytesIO(before.getvalue())).convert("RGB"),
-                Image.open(io.BytesIO(after.getvalue())).convert("RGB"),
-            )
-            st.metric("Visual change score", f"{result['change_score']:.0%}")
-            if result["verified"]:
-                st.success("The images show enough visual change to pass the demo verification.")
-            else:
-                st.warning("The images are still visually similar. Manual verification is recommended.")
+            try:
+                before_img = Image.open(io.BytesIO(before.getvalue()))
+                after_img = Image.open(io.BytesIO(after.getvalue()))
+                result = compare_images(before_img, after_img)
+                st.metric("Visual change score", f"{result['change_score']:.0%}")
+                if result["verified"]:
+                    st.success("The images show enough visual change to pass the demo verification.")
+                else:
+                    st.warning("The images are still visually similar. Manual verification is recommended.")
+            except Exception as e:
+                st.error(f"Error processing images: {e}")
 
 # ---------- About ----------
 
@@ -411,3 +439,4 @@ else:
         "to connect the AI engine to a real waste-image model and then add stronger "
         "duplicate detection, hotspot clustering and route optimization."
     )
+

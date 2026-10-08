@@ -1,6 +1,8 @@
 import json
+import logging
 import re
 
+logger = logging.getLogger(__name__)
 
 CATEGORY_KEYWORDS = {
     "Organic / Wet Waste": ["food", "vegetable", "fruit", "organic", "wet waste", "kitchen", "rotten", "leaf", "leaves"],
@@ -9,6 +11,11 @@ CATEGORY_KEYWORDS = {
     "E-Waste": ["electronic", "e-waste", "battery", "charger", "mobile", "computer", "laptop", "circuit"],
     "Hazardous Waste": ["chemical", "medical", "syringe", "paint", "toxic", "hazardous", "oil"],
 }
+
+ALLOWED_CATEGORIES = set(CATEGORY_KEYWORDS.keys()) | {"Mixed / Unclassified Waste"}
+ALLOWED_SEVERITIES = {"Low", "Medium", "High", "Critical"}
+ALLOWED_PRIORITIES = {"P1", "P2", "P3", "P4"}
+ALLOWED_DRAIN_RISKS = {"Low", "Medium", "High"}
 
 
 def keyword_category(text):
@@ -24,7 +31,10 @@ def keyword_category(text):
 
 
 def has_any(text, words):
-    return any(word in text for word in words)
+    for word in words:
+        if re.search(r"\b" + re.escape(word) + r"\b", text):
+            return True
+    return False
 
 
 def local_analysis(description, location, existing_reports):
@@ -47,7 +57,7 @@ def local_analysis(description, location, existing_reports):
 
     same_location = sum(
         str(r.get("location", "")).strip().lower() == location.strip().lower()
-        for r in existing_reports
+        for r in (existing_reports or [])
     )
 
     if severity == "Critical":
@@ -85,14 +95,33 @@ def local_analysis(description, location, existing_reports):
 
 
 def _extract_json(text):
+    if not text:
+        raise ValueError("AI returned an empty response.")
     text = text.strip()
     text = re.sub(r"^```json\s*", "", text, flags=re.I)
     text = re.sub(r"^```\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
     match = re.search(r"\{.*\}", text, flags=re.S)
     if not match:
-        raise ValueError("AI did not return JSON.")
-    return json.loads(match.group(0))
+        raise ValueError("AI response did not contain valid JSON structure.")
+    
+    data = json.loads(match.group(0))
+    if not isinstance(data, dict):
+        raise ValueError("AI JSON output is not an object.")
+
+    # Safe validation and default fallback application
+    data["category"] = data.get("category") if data.get("category") in ALLOWED_CATEGORIES else "Mixed / Unclassified Waste"
+    data["severity"] = data.get("severity") if data.get("severity") in ALLOWED_SEVERITIES else "Medium"
+    data["priority"] = data.get("priority") if data.get("priority") in ALLOWED_PRIORITIES else "P3"
+    data["drain_risk"] = data.get("drain_risk") if data.get("drain_risk") in ALLOWED_DRAIN_RISKS else "Low"
+    
+    try:
+        data["confidence"] = max(0.0, min(1.0, float(data.get("confidence", 0.75))))
+    except (ValueError, TypeError):
+        data["confidence"] = 0.75
+
+    data["recommended_action"] = str(data.get("recommended_action") or "Assign cleanup team.").strip()
+    return data
 
 
 def gemini_analysis(description, location, image_bytes, mime_type, api_key):
@@ -144,12 +173,11 @@ Keep recommended_action practical and short.
         )
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-2.0-flash",
         contents=contents,
     )
 
     result = _extract_json(response.text)
-    result["confidence"] = float(result.get("confidence", 0.75))
     result["analysis_mode"] = "Gemini multimodal AI"
     return result
 
@@ -169,8 +197,8 @@ def analyze_report(
                 description, location, image_bytes, mime_type, api_key
             )
             return result
-        except Exception:
-            # Never make the app unusable because the optional AI service failed.
-            pass
+        except Exception as e:
+            logger.warning(f"Gemini API analysis failed: {type(e).__name__}. Falling back to local analysis.")
 
     return local_analysis(description, location, existing_reports)
+
